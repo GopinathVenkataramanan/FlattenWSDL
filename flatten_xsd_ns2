@@ -1,0 +1,94 @@
+import sys
+import requests
+from lxml import etree
+from urllib.parse import urljoin
+
+# Constants for namespaces
+WSDL_NS = "http://schemas.xmlsoap.org/wsdl/"
+XSD_NS = "http://www.w3.org/2001/XMLSchema"
+NSMAP = {'wsdl': WSDL_NS, 'xsd': XSD_NS}
+
+visited_urls = set()
+collected_schemas = {}
+
+def fetch_and_parse(url):
+    response = requests.get(url)
+    response.raise_for_status()
+    return etree.XML(response.content)
+
+def collect_schemas(root_url, xml_element):
+    """
+    Recursively collects all imported/included schemas.
+    Stores them uniquely by targetNamespace.
+    """
+    for imp in xml_element.xpath('//xsd:import | //xsd:include', namespaces=NSMAP):
+        location = imp.get("schemaLocation")
+        if not location:
+            continue
+        full_url = urljoin(root_url, location)
+        if full_url in visited_urls:
+            continue
+        visited_urls.add(full_url)
+
+        imported_tree = fetch_and_parse(full_url)
+        target_ns = imported_tree.get("targetNamespace", "")
+
+        # Avoid duplicate schemas
+        if target_ns not in collected_schemas:
+            collected_schemas[target_ns] = imported_tree
+
+        # Recurse into any imports/includes inside the imported schema
+        collect_schemas(full_url, imported_tree)
+
+def ensure_xsd_namespace(schema_el):
+    """
+    Ensure xmlns:xsd is declared in schema element if used.
+    """
+    if "xsd" not in schema_el.nsmap:
+        schema_el.set("xmlns:xsd", XSD_NS)
+    return schema_el
+
+def flatten_wsdl(wsdl_url, output_file="flattened.wsdl"):
+    visited_urls.clear()
+    collected_schemas.clear()
+
+    root = fetch_and_parse(wsdl_url)
+
+    # Find or create <types>
+    types_node = root.find(f".//{{{WSDL_NS}}}types")
+    if types_node is None:
+        types_node = etree.SubElement(root, f"{{{WSDL_NS}}}types")
+
+    # Collect inline <xsd:schema> blocks and process imports
+    for schema in types_node.xpath('./xsd:schema', namespaces=NSMAP):
+        collect_schemas(wsdl_url, schema)
+
+        # Remove existing <xsd:import> and <xsd:include>
+        for el in schema.xpath('.//xsd:import | .//xsd:include', namespaces=NSMAP):
+            el.getparent().remove(el)
+
+        ensure_xsd_namespace(schema)
+
+    # Add collected external schemas as separate blocks
+    for ns, schema_tree in collected_schemas.items():
+        root_el = schema_tree.getroot()
+        ensure_xsd_namespace(root_el)
+
+        # Avoid duplicates in the main <types>
+        if not any(s.get("targetNamespace") == ns for s in types_node.xpath('./xsd:schema', namespaces=NSMAP)):
+            types_node.append(root_el)
+
+    # Write result
+    tree = etree.ElementTree(root)
+    tree.write(output_file, pretty_print=True, xml_declaration=True, encoding="utf-8")
+    print(f"✅ Flattened WSDL saved to: {output_file}")
+
+# Command-line entry
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python flatten_wsdl.py <WSDL_URL> [output_file]")
+        sys.exit(1)
+
+    wsdl_url = sys.argv[1]
+    output_file = sys.argv[2] if len(sys.argv) > 2 else "flattened.wsdl"
+    flatten_wsdl(wsdl_url, output_file)
