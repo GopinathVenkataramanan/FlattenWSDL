@@ -1,0 +1,73 @@
+import sys
+import requests
+from lxml import etree
+from urllib.parse import urljoin
+from collections import defaultdict
+from copy import deepcopy
+
+# Namespaces
+WSDL_NS = "http://schemas.xmlsoap.org/wsdl/"
+XSD_NS = "http://www.w3.org/2001/XMLSchema"
+NSMAP = {'wsdl': WSDL_NS, 'xsd': XSD_NS}
+
+visited_urls = set()
+schemas_by_namespace = defaultdict(list)
+
+def fetch_and_parse(url):
+    print(f"🔗 Fetching: {url}")
+    response = requests.get(url)
+    response.raise_for_status()
+    return etree.XML(response.content)
+
+def collect_and_merge_schemas(base_url, schema_el):
+    """
+    Recursively collect and group schema elements by targetNamespace.
+    Skip xsd:import and xsd:include.
+    """
+    for imp in schema_el.xpath('//xsd:import | //xsd:include', namespaces=NSMAP):
+        location = imp.get("schemaLocation")
+        if not location:
+            continue
+        full_url = urljoin(base_url, location)
+        if full_url in visited_urls:
+            continue
+        visited_urls.add(full_url)
+
+        imported = fetch_and_parse(full_url)
+        target_ns = imported.get("targetNamespace", "")
+
+        # Only non-import/include children
+        for child in imported.xpath('./xsd:*[not(local-name()="import" or local-name()="include")]', namespaces=NSMAP):
+            schemas_by_namespace[target_ns].append(child)
+
+        # Recurse into further includes/imports
+        collect_and_merge_schemas(full_url, imported)
+
+def ensure_xsd_namespace(schema_el):
+    if "xsd" not in schema_el.nsmap:
+        schema_el.set("xmlns:xsd", XSD_NS)
+
+def flatten_wsdl(wsdl_url, output_file="flattened_apim_ready.wsdl"):
+    visited_urls.clear()
+    schemas_by_namespace.clear()
+
+    root = fetch_and_parse(wsdl_url)
+
+    # Get or create <types>
+    types_node = root.find(f".//{{{WSDL_NS}}}types")
+    if types_node is None:
+        types_node = etree.SubElement(root, f"{{{WSDL_NS}}}types")
+
+    # Collect inline schemas
+    for schema in types_node.xpath('./xsd:schema', namespaces=NSMAP):
+        target_ns = schema.get("targetNamespace", "")
+
+        # Collect elements (excluding import/include)
+        for child in schema.xpath('./xsd:*[not(local-name()="import" or local-name()="include")]', namespaces=NSMAP):
+            schemas_by_namespace[target_ns].append(child)
+
+        # Recursively collect from imported schemas
+        collect_and_merge_schemas(wsdl_url, schema)
+
+    # Clear existing <types> content
+    types_node_
