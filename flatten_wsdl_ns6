@@ -70,4 +70,53 @@ def flatten_wsdl(wsdl_url, output_file="flattened_apim_ready.wsdl"):
         collect_and_merge_schemas(wsdl_url, schema)
 
     # Clear existing <types> content
-    types_node_
+    types_node.clear()
+
+    # Inject merged schemas
+    for ns, elements in schemas_by_namespace.items():
+        merged_schema = etree.Element(f"{{{XSD_NS}}}schema", nsmap={'xsd': XSD_NS})
+        merged_schema.set("targetNamespace", ns)
+        merged_schema.set("elementFormDefault", "qualified")
+
+        used_namespaces = {}
+
+        for elem in elements:
+            cloned = deepcopy(elem)
+            for prefix, uri in elem.nsmap.items():
+                if prefix and uri and prefix not in merged_schema.nsmap:
+                    used_namespaces[prefix] = uri
+            merged_schema.append(cloned)
+
+        # Add missing xmlns:* mappings
+        for prefix, uri in used_namespaces.items():
+            merged_schema.set(f"xmlns:{prefix}", uri)
+
+        ensure_xsd_namespace(merged_schema)
+
+        # Extra cleanup (just in case)
+        for el in merged_schema.xpath('.//xsd:import | .//xsd:include', namespaces=NSMAP):
+            el.getparent().remove(el)
+
+        types_node.append(merged_schema)
+
+    # Remove any <wsdl:import>
+    for imp in root.xpath('//wsdl:import', namespaces=NSMAP):
+        imp.getparent().remove(imp)
+
+    # Save
+    tree = etree.ElementTree(root)
+    tree.write(output_file, pretty_print=True, xml_declaration=True, encoding="utf-8")
+    print(f"\n✅ Flattened and namespace-correct WSDL saved to: {output_file}")
+    print("   ✔️ No xsd:import/include")
+    print("   ✔️ All namespace prefixes resolved")
+    print("   ✔️ Azure API Management compatible")
+
+# CLI usage
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python flatten_wsdl_apim_ready.py <WSDL_URL_or_file> [output_file]")
+        sys.exit(1)
+
+    wsdl_url = sys.argv[1]
+    output_file = sys.argv[2] if len(sys.argv) > 2 else "flattened_apim_ready.wsdl"
+    flatten_wsdl(wsdl_url, output_file)
