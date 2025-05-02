@@ -1,0 +1,98 @@
+import sys
+import requests
+from lxml import etree
+from urllib.parse import urljoin
+from collections import defaultdict
+
+# Namespaces
+WSDL_NS = "http://schemas.xmlsoap.org/wsdl/"
+XSD_NS = "http://www.w3.org/2001/XMLSchema"
+NSMAP = {'wsdl': WSDL_NS, 'xsd': XSD_NS}
+
+visited_urls = set()
+schemas_by_namespace = defaultdict(list)
+
+def fetch_and_parse(url):
+    print(f"🔗 Fetching: {url}")
+    response = requests.get(url)
+    response.raise_for_status()
+    return etree.XML(response.content)
+
+def collect_and_merge_schemas(base_url, schema_el):
+    """
+    Recursively collect and group schema elements by targetNamespace
+    """
+    for imp in schema_el.xpath('//xsd:import | //xsd:include', namespaces=NSMAP):
+        location = imp.get("schemaLocation")
+        if not location:
+            continue
+        full_url = urljoin(base_url, location)
+        if full_url in visited_urls:
+            continue
+        visited_urls.add(full_url)
+
+        imported = fetch_and_parse(full_url)
+        target_ns = imported.get("targetNamespace", "")
+
+        # Store children of the imported schema under its namespace
+        for child in imported.xpath('./xsd:*', namespaces=NSMAP):
+            schemas_by_namespace[target_ns].append(child)
+
+        # Recurse deeper
+        collect_and_merge_schemas(full_url, imported)
+
+def ensure_xsd_namespace(schema_el):
+    if "xsd" not in schema_el.nsmap:
+        schema_el.set("xmlns:xsd", XSD_NS)
+
+def flatten_wsdl(wsdl_url, output_file="flattened.wsdl"):
+    visited_urls.clear()
+    schemas_by_namespace.clear()
+
+    root = fetch_and_parse(wsdl_url)
+
+    # Get or create <types> block
+    types_node = root.find(f".//{{{WSDL_NS}}}types")
+    if types_node is None:
+        types_node = etree.SubElement(root, f"{{{WSDL_NS}}}types")
+
+    # Collect all inline schemas in the WSDL
+    for schema in types_node.xpath('./xsd:schema', namespaces=NSMAP):
+        target_ns = schema.get("targetNamespace", "")
+        # Store original schema's children
+        for child in schema.xpath('./xsd:*', namespaces=NSMAP):
+            schemas_by_namespace[target_ns].append(child)
+        # Also collect imports/includes recursively
+        collect_and_merge_schemas(wsdl_url, schema)
+
+    # Clear all <types> content
+    types_node.clear()
+
+    # Merge and insert all collected schemas by namespace
+    for ns, elements in schemas_by_namespace.items():
+        merged_schema = etree.Element(f"{{{XSD_NS}}}schema", nsmap={'xsd': XSD_NS})
+        merged_schema.set("targetNamespace", ns)
+        merged_schema.set("elementFormDefault", "qualified")
+        for elem in elements:
+            merged_schema.append(elem)
+        ensure_xsd_namespace(merged_schema)
+        types_node.append(merged_schema)
+
+    # Remove all <wsdl:import> tags (fully self-contained)
+    for imp in root.xpath('//wsdl:import', namespaces=NSMAP):
+        imp.getparent().remove(imp)
+
+    # Write to file
+    tree = etree.ElementTree(root)
+    tree.write(output_file, pretty_print=True, xml_declaration=True, encoding="utf-8")
+    print(f"\n✅ Independent WSDL ready for Azure APIM: {output_file}")
+
+# CLI usage
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python flatten_wsdl.py <WSDL_URL_or_path> [output_file]")
+        sys.exit(1)
+
+    wsdl_url = sys.argv[1]
+    output_file = sys.argv[2] if len(sys.argv) > 2 else "flattened_apim_ready.wsdl"
+    flatten_wsdl(wsdl_url, output_file)
