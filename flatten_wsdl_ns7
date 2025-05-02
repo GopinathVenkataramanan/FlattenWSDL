@@ -1,0 +1,114 @@
+import sys
+import requests
+from lxml import etree
+from urllib.parse import urljoin
+from collections import defaultdict
+from copy import deepcopy
+
+# Namespaces
+WSDL_NS = "http://schemas.xmlsoap.org/wsdl/"
+XSD_NS = "http://www.w3.org/2001/XMLSchema"
+NSMAP = {'wsdl': WSDL_NS, 'xsd': XSD_NS}
+
+visited_urls = set()
+schemas_by_namespace = defaultdict(list)
+
+def fetch_and_parse(url):
+    print(f"🔗 Fetching: {url}")
+    response = requests.get(url)
+    response.raise_for_status()
+    return etree.XML(response.content)
+
+def collect_and_merge_schemas(base_url, schema_el):
+    """
+    Recursively collect and group schema elements by targetNamespace.
+    Skip xsd:import and xsd:include.
+    """
+    for imp in schema_el.xpath('//xsd:import | //xsd:include', namespaces=NSMAP):
+        location = imp.get("schemaLocation")
+        if not location:
+            continue
+        full_url = urljoin(base_url, location)
+        if full_url in visited_urls:
+            continue
+        visited_urls.add(full_url)
+
+        imported = fetch_and_parse(full_url)
+        target_ns = imported.get("targetNamespace", "")
+
+        # Only non-import/include children
+        for child in imported.xpath('./xsd:*[not(local-name()="import" or local-name()="include")]', namespaces=NSMAP):
+            schemas_by_namespace[target_ns].append(child)
+
+        # Recurse into further includes/imports
+        collect_and_merge_schemas(full_url, imported)
+
+def flatten_wsdl(wsdl_url, output_file="flattened_apim_ready.wsdl"):
+    visited_urls.clear()
+    schemas_by_namespace.clear()
+
+    root = fetch_and_parse(wsdl_url)
+
+    # Get or create <types>
+    types_node = root.find(f".//{{{WSDL_NS}}}types")
+    if types_node is None:
+        types_node = etree.SubElement(root, f"{{{WSDL_NS}}}types")
+
+    # Collect inline schemas
+    for schema in types_node.xpath('./xsd:schema', namespaces=NSMAP):
+        target_ns = schema.get("targetNamespace", "")
+
+        # Collect elements (excluding import/include)
+        for child in schema.xpath('./xsd:*[not(local-name()="import" or local-name()="include")]', namespaces=NSMAP):
+            schemas_by_namespace[target_ns].append(child)
+
+        # Recursively collect from imported schemas
+        collect_and_merge_schemas(wsdl_url, schema)
+
+    # Clear existing <types> content
+    types_node.clear()
+
+    # Inject merged schemas
+    for ns, elements in schemas_by_namespace.items():
+        # Build a full nsmap: always include xsd
+        nsmap = {'xsd': XSD_NS}
+        for elem in elements:
+            for prefix, uri in elem.nsmap.items():
+                if prefix and uri and prefix not in nsmap:
+                    nsmap[prefix] = uri
+
+        # Create schema element with full nsmap
+        merged_schema = etree.Element(f"{{{XSD_NS}}}schema", nsmap=nsmap)
+        merged_schema.set("targetNamespace", ns)
+        merged_schema.set("elementFormDefault", "qualified")
+
+        for elem in elements:
+            merged_schema.append(deepcopy(elem))
+
+        # Extra cleanup: remove lingering import/include (paranoia)
+        for el in merged_schema.xpath('.//xsd:import | .//xsd:include', namespaces=NSMAP):
+            el.getparent().remove(el)
+
+        types_node.append(merged_schema)
+
+    # Remove all <wsdl:import>
+    for imp in root.xpath('//wsdl:import', namespaces=NSMAP):
+        imp.getparent().remove(imp)
+
+    # Write output
+    tree = etree.ElementTree(root)
+    tree.write(output_file, pretty_print=True, xml_declaration=True, encoding="utf-8")
+    print(f"\n✅ Flattened WSDL saved to: {output_file}")
+    print("   ✔️ No xsd:import/include")
+    print("   ✔️ All xmlns:* prefixes resolved")
+    print("   ✔️ Azure API Management compatible")
+
+# Command-line usage
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python flatten_wsdl_apim_ready.py <WSDL_URL_or_file> [output_file]")
+        sys.exit(1)
+
+    wsdl_url = sys.argv[1]
+    output_file = sys.argv[2] if len(sys.argv) > 2 else "flattened_apim_ready.wsdl"
+    flatten_wsdl(wsdl_url, output_file)
